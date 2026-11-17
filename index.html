@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1033">
+  <title>Banko-hjælper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Lilita+One&family=Rubik:wght@400;500;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23e63946'/%3E%3Ccircle cx='32' cy='32' r='18' fill='%23fff'/%3E%3Ctext x='32' y='40' font-size='22' text-anchor='middle' font-family='Arial' font-weight='bold'%3EB%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+  <div class="lights" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <h1 class="logo">
+      <span class="logo-ball b1">B</span><span class="logo-ball b2">A</span><span class="logo-ball b3">N</span><span class="logo-ball b4">K</span><span class="logo-ball b5">O</span>
+      <small>hjælperen</small>
+    </h1>
+    <button id="soundBtn" class="icon-btn" title="Lyd til/fra" aria-label="Lyd til/fra">🔊</button>
+  </header>
+
+  <main>
+    <!-- ============ OPRÅB ============ -->
+    <section class="caller panel" aria-label="Opråb">
+      <div class="caller-top">
+        <div class="last-ball-wrap">
+          <div id="lastBall" class="ball ball-xl empty">?</div>
+          <div class="last-label">Sidste tal</div>
+        </div>
+        <div class="caller-entry">
+          <form id="callForm" class="call-form" autocomplete="off">
+            <input id="callInput" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="2" placeholder="Tal" aria-label="Opråbt tal">
+            <button type="submit" class="btn btn-gold">Kryds af</button>
+          </form>
+          <div class="caller-meta">
+            <span id="calledCount" class="pill">0 / 90 råbt</span>
+            <button id="undoBtn" class="link-btn" type="button">↶ Fortryd sidste</button>
+          </div>
+          <div id="history" class="history" aria-label="Tidligere tal"></div>
+        </div>
+      </div>
+
+      <details id="boardDetails" class="board-details">
+        <summary>Vis tavlen 1–90</summary>
+        <div id="board" class="board" role="grid" aria-label="Tavle med alle tal"></div>
+      </details>
+    </section>
+
+    <!-- ============ STATUS ============ -->
+    <section id="statusBar" class="status-bar" aria-live="polite"></section>
+
+    <!-- ============ PLADER ============ -->
+    <section class="plates-section">
+      <div class="section-head">
+        <h2>Mine plader <span id="plateCount" class="count-badge">0</span></h2>
+        <div class="section-actions">
+          <button id="scanBtn" class="btn btn-red">📷 Scan plade</button>
+          <button id="manualBtn" class="btn btn-ghost">✍️ Indtast</button>
+        </div>
+      </div>
+      <div id="plates" class="plates"></div>
+      <div id="emptyState" class="empty-state">
+        <div class="empty-balls"><span class="ball ball-md c3">7</span><span class="ball ball-md c5">42</span><span class="ball ball-md c8">88</span></div>
+        <p>Ingen plader endnu.</p>
+        <p class="muted">Tag et billede af din bankoplade, eller indtast tallene selv.</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <button id="resetBtn" class="btn btn-danger">⟲ Nulstil runden</button>
+      <p class="muted small">Pladerne gemmes på denne telefon. Nulstil runden rydder kun de råbte tal.</p>
+    </footer>
+  </main>
+
+  <!-- ============ SCAN-DIALOG ============ -->
+  <dialog id="scanDialog" class="modal">
+    <div class="modal-head">
+      <h3 id="scanTitle">Scan plade</h3>
+      <button class="icon-btn close-btn" data-close aria-label="Luk">✕</button>
+    </div>
+
+    <div class="scan-step" data-step="pick">
+      <p>Tag et billede af <b>én plade</b> lige forfra og med godt lys.</p>
+      <div class="pick-buttons">
+        <label class="btn btn-red big-btn">📷 Tag billede
+          <input id="cameraInput" type="file" accept="image/*" capture="environment" hidden>
+        </label>
+        <label class="btn btn-ghost big-btn">🖼️ Vælg fra galleri
+          <input id="galleryInput" type="file" accept="image/*" hidden>
+        </label>
+      </div>
+    </div>
+
+    <div class="scan-step" data-step="crop" hidden>
+      <p>Træk de fire <b>gule hjørner</b> ud til pladens hjørner, så gitteret passer med felterne.</p>
+      <div class="crop-wrap"><canvas id="cropCanvas"></canvas></div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" data-goto="pick">← Nyt billede</button>
+        <button id="autoCornersBtn" class="btn btn-ghost">⤢ Nulstil hjørner</button>
+        <button id="runOcrBtn" class="btn btn-gold">Scan tallene →</button>
+      </div>
+    </div>
+
+    <div class="scan-step" data-step="ocr" hidden>
+      <div class="ocr-progress">
+        <div class="spinner-balls"><span class="ball ball-md c1">1</span><span class="ball ball-md c4">4</span><span class="ball ball-md c7">7</span></div>
+        <p id="ocrStatus">Læser tallene …</p>
+        <div class="progress"><div id="ocrBar" class="progress-bar"></div></div>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- ============ EDITOR-DIALOG ============ -->
+  <dialog id="editDialog" class="modal">
+    <div class="modal-head">
+      <h3 id="editTitle">Indtast plade</h3>
+      <button class="icon-btn close-btn" data-close aria-label="Luk">✕</button>
+    </div>
+    <img id="editPreview" class="edit-preview" alt="Den scannede plade" hidden>
+    <p id="editHint" class="muted small"></p>
+    <div class="edit-row">
+      <label class="field">Navn
+        <input id="plateName" type="text" maxlength="24" placeholder="fx Plade 1">
+      </label>
+      <div class="field">Farve
+        <div id="colorPicker" class="color-picker"></div>
+      </div>
+    </div>
+    <div id="editGrid" class="edit-grid"></div>
+    <div id="editErrors" class="edit-errors" aria-live="polite"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" data-close>Annuller</button>
+      <button id="savePlateBtn" class="btn btn-gold">Gem plade</button>
+    </div>
+  </dialog>
+
+  <!-- ============ BEKRÆFT-DIALOG ============ -->
+  <dialog id="confirmDialog" class="modal modal-small">
+    <h3 id="confirmTitle">Er du sikker?</h3>
+    <p id="confirmText"></p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" data-answer="no">Annuller</button>
+      <button class="btn btn-danger" data-answer="yes" id="confirmYes">Ja</button>
+    </div>
+  </dialog>
+
+  <!-- ============ GEVINST ============ -->
+  <div id="winOverlay" class="win-overlay" hidden>
+    <div class="win-card">
+      <div class="win-burst" aria-hidden="true"></div>
+      <div id="winTitle" class="win-title">BANKO!</div>
+      <div id="winText" class="win-text"></div>
+      <button id="winClose" class="btn btn-gold big-btn">Super! 🎉</button>
+    </div>
+  </div>
+  <canvas id="confetti" class="confetti" aria-hidden="true"></canvas>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <script src="js/celebrate.js"></script>
+  <script src="js/scanner.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
