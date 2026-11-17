@@ -9,7 +9,7 @@
   const esc = s => String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 
   /* ================= tilstand ================= */
-  let state = { plates: [], called: [], celebrated: {}, sound: true };
+  let state = { plates: [], called: [], celebrated: {}, sound: true, stage: 1 };
   try {
     const saved = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
     if (saved && Array.isArray(saved.plates)) state = Object.assign(state, saved);
@@ -27,11 +27,12 @@
     const sorted = remaining.map(r => r.length).sort((a, b) => a - b);
     // mangler til 1, 2 og 3 rækker = summen af de L korteste rester
     const missing = [0, sorted[0], sorted[0] + sorted[1], sorted[0] + sorted[1] + sorted[2]];
+    const target = Math.max(level + 1, state.stage || 1);
     let waitingFor = [];
-    if (level < 3 && missing[level + 1] === 1) {
+    if (target <= 3 && missing[target] === 1) {
       waitingFor = remaining.filter(r => r.length === 1).map(r => r[0]).sort((a, b) => a - b);
     }
-    return { remaining, rowDone, level, missing, waitingFor };
+    return { remaining, rowDone, level, missing, waitingFor, target };
   }
 
   const dabStyle = n => {
@@ -78,6 +79,11 @@
       b.classList.toggle('mine', mine.has(n));
     });
 
+    document.querySelectorAll('#stageBtns [data-stage]').forEach(b => {
+      const on = +b.dataset.stage === state.stage;
+      b.classList.toggle('on', on); b.setAttribute('aria-checked', on);
+    });
+
     // plader
     const infos = state.plates.map(plateInfo);
     $('#plates').innerHTML = state.plates.map((p, i) => plateHTML(p, infos[i], i)).join('');
@@ -90,7 +96,7 @@
 
   function plateHTML(p, info, idx) {
     const tilt = (((idx * 7919) % 9) - 4) * 0.12;
-    const nextMissing = info.level < 3 ? info.missing[info.level + 1] : 0;
+    const nextMissing = info.target <= 3 ? info.missing[info.target] : 0;
     const cls = ['plate', info.level === 3 ? 'full' : nextMissing === 1 ? 'hot' : ''].join(' ');
     let cells = '';
     for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
@@ -102,8 +108,9 @@
     }
     const chips = [1, 2, 3].map(L => {
       if (info.level >= L) return `<span class="chip done">✓ ${LEVEL_NAMES[L]}</span>`;
+      if (L < state.stage) return `<span class="chip past">${LEVEL_NAMES[L]}: gået</span>`;
       const m = info.missing[L];
-      return `<span class="chip${m === 1 && L === info.level + 1 ? ' one' : ''}">${LEVEL_NAMES[L]}: mangler ${m}</span>`;
+      return `<span class="chip${m === 1 && L === info.target ? ' one' : ''}">${LEVEL_NAMES[L]}: mangler ${m}</span>`;
     }).join('');
     const waiting = info.waitingFor.length
       ? `<div class="waiting">Venter på: ${info.waitingFor.map(n => `<b>${n}</b>`).join(', ')}</div>` : '';
@@ -127,21 +134,24 @@
     if (!state.plates.length) { bar.innerHTML = ''; return; }
     const chips = [];
     const best = Math.max(0, ...infos.map(i => i.level));
-    if (best > 0) {
+    if (best > 0 && best >= state.stage) {
       const names = state.plates.filter((p, i) => infos[i].level === best).map(p => esc(p.name)).join(', ');
       chips.push(`<span class="status-chip win">🏆 ${LEVEL_NAMES[best]}: ${names}</span>`);
     }
     state.plates.forEach((p, i) => {
       const inf = infos[i];
-      if (inf.level < 3 && inf.waitingFor.length) {
-        chips.push(`<span class="status-chip hot">🔥 ${esc(p.name)} mangler 1 til ${LEVEL_NAMES[inf.level + 1].toLowerCase()} – venter på ${inf.waitingFor.join(', ')}</span>`);
+      if (inf.target <= 3 && inf.waitingFor.length) {
+        chips.push(`<span class="status-chip hot">🔥 ${esc(p.name)} mangler 1 til ${LEVEL_NAMES[inf.target].toLowerCase()} – venter på ${inf.waitingFor.join(', ')}</span>`);
       }
     });
     if (!chips.length) {
       if (!state.called.length) chips.push('<span class="status-chip">Klar! Skriv det første opråbte tal 🎤</span>');
       else {
-        const closest = Math.min(...infos.map(i => i.missing[i.level + 1] ?? 99));
-        chips.push(`<span class="status-chip">Tættest på næste gevinst: mangler ${closest}</span>`);
+        const open = infos.filter(i => i.target <= 3);
+        if (open.length) {
+          const closest = Math.min(...open.map(i => i.missing[i.target]));
+          chips.push(`<span class="status-chip">Tættest på ${LEVEL_NAMES[state.stage].toLowerCase()}: mangler ${closest}</span>`);
+        }
       }
     }
     bar.innerHTML = chips.join('');
@@ -153,7 +163,7 @@
     state.plates.forEach(p => {
       const lvl = plateInfo(p).level;
       const had = state.celebrated[p.id] || 0;
-      if (lvl > had) wins.push({ plate: p, level: lvl });
+      if (lvl > had && lvl >= state.stage) wins.push({ plate: p, level: lvl });
       state.celebrated[p.id] = lvl;   // falder også, hvis et tal fjernes igen
     });
     if (!wins.length) return;
@@ -162,6 +172,10 @@
     $('#winTitle').textContent = top === 3 ? 'BANKO!' : 'GEVINST!';
     $('#winText').innerHTML = `<span class="lvl">${LEVEL_NAMES[top]}</span>på ${names.join(' og ')}`
       + (top < 3 ? '<br><small>Råb op – og spil videre!</small>' : '<br><small>Hele pladen er fuld!</small>');
+    const nb = $('#winNext');
+    nb.hidden = top >= 3 || state.stage > top;
+    if (!nb.hidden) nb.textContent = `Spil videre om ${LEVEL_NAMES[top + 1].toLowerCase()} →`;
+    nb.dataset.stage = top + 1;
     $('#winOverlay').hidden = false;
     Celebrate.confetti(top === 3 ? 320 : top === 2 ? 200 : 130);
     if (top === 3) setTimeout(() => Celebrate.confetti(220), 700);
@@ -170,6 +184,22 @@
     $('#winClose').focus();
   }
   $('#winClose').addEventListener('click', () => { $('#winOverlay').hidden = true; $('#callInput').focus(); });
+  $('#winNext').addEventListener('click', () => {
+    $('#winOverlay').hidden = true;
+    setStage(+$('#winNext').dataset.stage);
+  });
+
+  /* ================= der spilles om ================= */
+  function setStage(n) {
+    state.stage = n;
+    // gevinster under det nye niveau skal ikke fejres; dem der allerede er nået, er set
+    save(); render();
+    toast(`Der spilles nu om ${LEVEL_NAMES[n].toLowerCase()}`);
+  }
+  $('#stageBtns').addEventListener('click', e => {
+    const b = e.target.closest('[data-stage]');
+    if (b && +b.dataset.stage !== state.stage) setStage(+b.dataset.stage);
+  });
 
   /* ================= opråb ================= */
   function commit() { save(); render(); checkWins(); }
@@ -236,8 +266,8 @@
 
   $('#resetBtn').addEventListener('click', async () => {
     if (!state.called.length) { toast('Der er ingen råbte tal at nulstille'); return; }
-    if (await confirmBox('Nulstil runden?', `Alle ${state.called.length} råbte tal bliver ryddet. Dine plader bliver liggende.`, 'Nulstil')) {
-      state.called = []; state.celebrated = {};
+    if (await confirmBox('Nulstil runden?', `Alle ${state.called.length} råbte tal bliver ryddet, og der spilles igen om 1 række. Dine plader bliver liggende.`, 'Nulstil')) {
+      state.called = []; state.celebrated = {}; state.stage = 1;
       commit();
       toast('Ny runde – held og lykke! 🍀');
     }
@@ -303,6 +333,19 @@
   $('#cameraInput').addEventListener('change', onFile);
   $('#galleryInput').addEventListener('change', onFile);
   $('#autoCornersBtn').addEventListener('click', () => crop.resetCorners());
+  function rotateImage(dir) {
+    if (!currentImage) return;
+    const src = currentImage, c = document.createElement('canvas');
+    c.width = src.height; c.height = src.width;
+    const ctx = c.getContext('2d');
+    ctx.translate(c.width / 2, c.height / 2);
+    ctx.rotate(dir * Math.PI / 2);
+    ctx.drawImage(src, -src.width / 2, -src.height / 2);
+    currentImage = c;
+    crop.setImage(c);
+  }
+  $('#rotLeftBtn').addEventListener('click', () => rotateImage(-1));
+  $('#rotRightBtn').addEventListener('click', () => rotateImage(1));
 
   $('#runOcrBtn').addEventListener('click', async () => {
     if (!currentImage) return;

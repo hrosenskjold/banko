@@ -1,8 +1,7 @@
 /* Scanning af bankoplader: beskæring med 4 hjørner, perspektiv-udretning,
-   opdeling i 3x9 felter og tal-genkendelse med Tesseract.js (i browseren). */
+   opdeling i 3x9 felter og tal-genkendelse med et lille neuralt netværk (js/digits.js) – alt sker i browseren. */
 window.Scanner = (() => {
   const ROWS = 3, COLS = 9, CELL = 120;          // udrettet plade: 1080 x 360 px
-  const TESSERACT_URL = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
 
   /* ---------- hjælpere ---------- */
   const colOf = n => (n === 90 ? 8 : Math.floor(n / 10));
@@ -244,6 +243,46 @@ window.Scanner = (() => {
     return p && q ? [...p, ...q] : null;
   }
 
+  // Fjerner gitterlinjer: en pixel hører til en linje, hvis der går en sammenhængende sti
+  // på mindst én feltlængde igennem den (højst 1 px drift pr. række – tåler skæve og
+  // håndtegnede linjer). Et ciffer er aldrig så langt, så kun linjerne fjernes, og tal
+  // der rører en linje, skilles fra gitteret.
+  function removeGridLines(bin, W, H) {
+    const L = CELL;
+    const erase = new Uint8Array(W * H);
+    const a = new Int16Array(W * H), b = new Int16Array(W * H);
+    // lodrette linjer: længste sti oppefra (a) og nedefra (b)
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const i = y * W + x; if (!bin[i]) continue;
+      let m = 0;
+      if (y > 0) for (let d = -1; d <= 1; d++) { const xx = x + d; if (xx >= 0 && xx < W && a[i - W + d] > m) m = a[i - W + d]; }
+      a[i] = m + 1;
+    }
+    for (let y = H - 1; y >= 0; y--) for (let x = 0; x < W; x++) {
+      const i = y * W + x; if (!bin[i]) continue;
+      let m = 0;
+      if (y < H - 1) for (let d = -1; d <= 1; d++) { const xx = x + d; if (xx >= 0 && xx < W && b[i + W + d] > m) m = b[i + W + d]; }
+      b[i] = m + 1;
+    }
+    for (let i = 0; i < bin.length; i++) if (bin[i] && a[i] + b[i] - 1 >= L) erase[i] = 1;
+    // vandrette linjer: længste sti fra venstre (a) og fra højre (b)
+    a.fill(0); b.fill(0);
+    for (let x = 0; x < W; x++) for (let y = 0; y < H; y++) {
+      const i = y * W + x; if (!bin[i]) continue;
+      let m = 0;
+      if (x > 0) for (let d = -1; d <= 1; d++) { const yy = y + d; if (yy >= 0 && yy < H && a[i - 1 + d * W] > m) m = a[i - 1 + d * W]; }
+      a[i] = m + 1;
+    }
+    for (let x = W - 1; x >= 0; x--) for (let y = 0; y < H; y++) {
+      const i = y * W + x; if (!bin[i]) continue;
+      let m = 0;
+      if (x < W - 1) for (let d = -1; d <= 1; d++) { const yy = y + d; if (yy >= 0 && yy < H && b[i + 1 + d * W] > m) m = b[i + 1 + d * W]; }
+      b[i] = m + 1;
+    }
+    for (let i = 0; i < bin.length; i++) if (bin[i] && a[i] + b[i] - 1 >= L) erase[i] = 1;
+    for (let i = 0; i < bin.length; i++) if (erase[i]) bin[i] = 0;
+  }
+
   // Finder alle tal på hele den udrettede plade og placerer hvert tal i præcis ét felt
   // ud fra tallets midtpunkt. Det tåler, at hjørnerne er sat lidt skævt.
   // Returnerer [{r, c, img}] hvor img er et sort/hvidt canvas klar til OCR.
@@ -263,6 +302,8 @@ window.Scanner = (() => {
       const t = thr[Math.min(ROWS - 1, (y / CELL) | 0) * COLS + Math.min(COLS - 1, (x / CELL) | 0)];
       if (gray[y * W + x] < t) bin[y * W + x] = 1;
     }
+
+    removeGridLines(bin, W, H);
 
     // sammenhængende komponenter (8-naboskab)
     const label = new Int32Array(W * H);
@@ -287,9 +328,14 @@ window.Scanner = (() => {
     }
     // ciffer-lignende: rimelig højde, ikke gitterlinjer, ikke støj
     const digits = comps.filter(k =>
-      k.pixels.length >= CELL * CELL * 0.004 &&
-      k.bh >= CELL * 0.2 && k.bh <= CELL * 0.92 && k.bw <= CELL * 0.8 &&
-      k.pixels.length / (k.bw * k.bh) > 0.12);
+      k.pixels.length >= CELL * CELL * 0.003 &&
+      k.bh >= CELL * 0.2 && k.bh <= CELL * 0.92 && k.bw <= CELL * 1.0 && k.bw > 2 &&
+      // tynd stump ved billedkanten = rest af pladens kant, ikke et ciffer
+      !((k.mnx === 0 || k.mny === 0 || k.mxx === W - 1 || k.mxy === H - 1) && (k.bw < CELL * 0.15 || k.bh < CELL * 0.15)) &&
+      k.pixels.length / (k.bw * k.bh) > 0.05);
+    // små stykker (fx 5-tallets top-streg eller en løs streg i håndskrift)
+    const frags = comps.filter(k => !digits.includes(k) &&
+      k.pixels.length >= CELL * CELL * 0.0012 && k.bh < CELL * 0.35 && k.bw < CELL * 0.5);
 
     // saml cifre, der står side om side, til ét tal (union-find)
     const parent = digits.map((_, i) => i);
@@ -300,26 +346,38 @@ window.Scanner = (() => {
       const a = digits[i], b = digits[j];
       const gap = Math.max(a.mnx - b.mxx, b.mnx - a.mxx);
       const vOverlap = Math.min(a.mxy, b.mxy) - Math.max(a.mny, b.mny);
-      const similar = Math.min(a.bh, b.bh) / Math.max(a.bh, b.bh) > 0.6;
-      if (gap < CELL * 0.2 && vOverlap > Math.min(a.bh, b.bh) * 0.6 && similar) pairs.push([gap, i, j]);
+      const similar = Math.min(a.bh, b.bh) / Math.max(a.bh, b.bh) > 0.45;
+      if (gap < CELL * 0.2 && vOverlap > Math.min(a.bh, b.bh) * 0.4 && similar) pairs.push([gap, i, j]);
     }
     pairs.sort((p, q) => p[0] - q[0]);                   // tætteste par først
     for (const [, i, j] of pairs) {
       const ri = find(i), rj = find(j);
       if (ri === rj) continue;
       const lo = Math.min(box[ri][0], box[rj][0]), hi = Math.max(box[ri][1], box[rj][1]);
-      if (hi - lo > CELL * 0.95) continue;                // et tal er aldrig bredere end et felt
+      if (hi - lo > CELL * 1.05) continue;                // et tal er aldrig bredere end et felt
       parent[ri] = rj; box[rj] = [lo, hi];
     }
     const groups = new Map();
     digits.forEach((d, i) => { const g = find(i); if (!groups.has(g)) groups.set(g, []); groups.get(g).push(d); });
 
+    // hæng små stykker på det tal, de sidder i
+    const groupList = [...groups.values()];
+    for (const f of frags) {
+      const fx = (f.mnx + f.mxx) / 2, fy = (f.mny + f.mxy) / 2;
+      const g = groupList.find(parts => {
+        const x0 = Math.min(...parts.map(k => k.mnx)), x1 = Math.max(...parts.map(k => k.mxx));
+        const y0 = Math.min(...parts.map(k => k.mny)), y1 = Math.max(...parts.map(k => k.mxy));
+        return fx >= x0 - CELL * 0.08 && fx <= x1 + CELL * 0.08 && fy >= y0 - CELL * 0.12 && fy <= y1 + CELL * 0.12;
+      });
+      if (g) g.push(f);
+    }
+
     const nums = [];
-    for (const parts of groups.values()) {
+    for (const parts of groupList) {
       const bx0 = Math.min(...parts.map(k => k.mnx)), bx1 = Math.max(...parts.map(k => k.mxx));
       const by0 = Math.min(...parts.map(k => k.mny)), by1 = Math.max(...parts.map(k => k.mxy));
       const area = parts.reduce((s, k) => s + k.pixels.length, 0);
-      if (area < CELL * CELL * 0.012 || bx1 - bx0 > CELL * 1.1) continue;
+      if (area < CELL * CELL * 0.008 || bx1 - bx0 > CELL * 1.15) continue;
       nums.push({ parts, bx0, bx1, by0, by1, area, x: (bx0 + bx1) / 2, y: (by0 + by1) / 2 });
     }
 
@@ -381,102 +439,25 @@ window.Scanner = (() => {
       placed.push(Object.assign(n, { r, c }));
     }
 
-    return placed.map(g => {
-      // tegn cifrene sort på hvidt med luft omkring og fast højde
-      const bw = g.bx1 - g.bx0 + 1, bh = g.by1 - g.by0 + 1;
-      const tmp = document.createElement('canvas'); tmp.width = bw; tmp.height = bh;
-      const tctx = tmp.getContext('2d');
-      const im = tctx.createImageData(bw, bh);
-      im.data.fill(255);
-      for (const k of g.parts) for (const p of k.pixels) {
-        const x = p % W - g.bx0, y = ((p / W) | 0) - g.by0, o = (y * bw + x) * 4;
-        im.data[o] = im.data[o + 1] = im.data[o + 2] = 0;
-      }
-      tctx.putImageData(im, 0, 0);
-      const TH = 64, sc = TH / bh, pad = 28;
-      const out = document.createElement('canvas');
-      out.width = Math.round(bw * sc) + pad * 2; out.height = TH + pad * 2;
-      const octx = out.getContext('2d');
-      octx.fillStyle = '#fff'; octx.fillRect(0, 0, out.width, out.height);
-      octx.imageSmoothingEnabled = true;
-      octx.drawImage(tmp, pad, pad, Math.round(bw * sc), TH);
-      return { r: g.r, c: g.c, area: g.area, img: out };
-    });
-  }
-
-  /* ---------- Tesseract ---------- */
-  let workerPromise = null;
-  function loadScript(src) {
-    return new Promise((res, rej) => {
-      if (window.Tesseract) return res();
-      const s = document.createElement('script');
-      s.src = src; s.onload = res; s.onerror = () => rej(new Error('Kunne ikke hente tekstgenkendelse (mangler internet?)'));
-      document.head.appendChild(s);
-    });
-  }
-  function getWorker(onStatus) {
-    if (!workerPromise) {
-      workerPromise = (async () => {
-        onStatus && onStatus('Henter tekstgenkendelse … (kun første gang)');
-        await loadScript(TESSERACT_URL);
-        const w = await Tesseract.createWorker('eng', 1);
-        await w.setParameters({
-          tessedit_char_whitelist: '0123456789',
-          tessedit_pageseg_mode: '8',      // ét ord
-        });
-        return w;
-      })().catch(e => { workerPromise = null; throw e; });
-    }
-    return workerPromise;
-  }
-
-  // Ret tallet ud fra kolonnens talområde. Returnerer {value, unsure}.
-  function fitToColumn(text, conf, c) {
-    const digits = (text || '').replace(/\D/g, '');
-    const [lo, hi] = colRange(c);
-    if (!digits) return { value: null, unsure: true };
-    let v = parseInt(digits, 10);
-    if (v >= lo && v <= hi) return { value: v, unsure: conf < 60 };
-    // kolonne 1: kun ét ciffer
-    if (c === 0) {
-      const last = parseInt(digits.slice(-1), 10);
-      return last >= 1 ? { value: last, unsure: true } : { value: null, unsure: true };
-    }
-    // ét ciffer læst: tilføj kolonnens tier-ciffer
-    const tens = c;
-    const ones = parseInt(digits.slice(-1), 10);
-    let guess = tens * 10 + ones;
-    if (c === 8 && digits.length >= 2 && digits.slice(-2) === '90') guess = 90;
-    if (guess >= lo && guess <= hi) return { value: guess, unsure: true };
-    return { value: null, unsure: true };
+    return placed;
   }
 
   async function recognize(warped, onProgress) {
     const gray = grayOf(warped);
-    const found = extractNumbers(gray, warped.width, warped.height);
-    const worker = await getWorker(s => onProgress && onProgress(0, s));
+    const W = warped.width;
+    onProgress && onProgress(0.1, 'Finder tallene …');
+    await new Promise(r => setTimeout(r, 30));          // lad UI'et nå at tegne
+    const found = extractNumbers(gray, W, warped.height);
 
-    // 1) læs hvert tal
+    // læs hvert tal; tallets værdi bestemmer kolonnen, positionen er kontrol
+    const cand = [];
     let done = 0;
     for (const f of found) {
-      const { data } = await worker.recognize(f.img);
-      f.text = (data.text || '').replace(/\D/g, '');
-      f.conf = data.confidence;
+      const res = Digits.readNumber(f.parts, W, f.c);
+      if (res) cand.push({ r: f.r, c: res.col, value: res.value, unsure: res.confidence < 0.93 || res.col !== f.c, score: res.confidence + (res.col === f.c ? 1 : 0) + f.area / 1e5 });
       done++;
-      onProgress && onProgress(done / found.length, `Læser tal ${done} af ${found.length} …`);
-    }
-
-    // 2) placér: tallets værdi bestemmer kolonnen (26 hører i 20'erne), positionen er kontrol.
-    //    Giver værdien ikke mening, bruges positionen og kolonnens talområde.
-    const cand = [];
-    for (const f of found) {
-      const v = f.text ? parseInt(f.text, 10) : NaN;
-      if (v >= 1 && v <= 90 && Math.abs(colOf(v) - f.c) <= 1) {
-        cand.push({ r: f.r, c: colOf(v), value: v, unsure: f.conf < 60, score: f.conf + f.area / 100 });
-      } else {
-        const fit = fitToColumn(f.text, f.conf, f.c);
-        if (fit.value != null) cand.push({ r: f.r, c: f.c, value: fit.value, unsure: true, score: f.conf / 2 });
-      }
+      onProgress && onProgress(0.1 + 0.9 * done / found.length, `Læser tal ${done} af ${found.length} …`);
+      if (done % 4 === 0) await new Promise(r => setTimeout(r, 0));
     }
     const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
     const unsure = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
