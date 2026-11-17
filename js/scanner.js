@@ -781,6 +781,44 @@ window.Scanner = (() => {
     return placed;
   }
 
+  // På bankoplader stiger tallene nedad i hver kolonne (fx 33 over 34). Vælg for hver kolonne den
+  // kombination af mulige læsninger, der både er mest sandsynlig og stiger nedad. Reglen er stærk,
+  // men ikke absolut, så hjemmelavede plader uden sortering stadig kan læses, når tallene er tydelige.
+  function orderColumns(items) {
+    const VIOLATION = Math.log(1e-3);
+    const byCol = new Map();
+    // grupper efter kolonnen for den bedste læsning; kandidater holdes i samme kolonne,
+    // så rækkefølge-reglen aldrig skubber et tal over i en nabokolonne
+    for (const f of items) { const c = f.res.col; if (!byCol.has(c)) byCol.set(c, []); byCol.get(c).push(f); }
+    for (const [col, list] of byCol) {
+      if (list.length < 2 || list.length > 4) continue;     // en rigtig kolonne har højst 3 tal
+      list.sort((a, b) => a.r - b.r || a.x - b.x);
+      const opts = list.map(f => {
+        const same = f.res.top.filter(([v]) => colOf(v) === col);
+        return (same.length ? same : f.res.top).slice(0, list.length > 2 ? 6 : 8);
+      });
+      const combos = [];
+      const walk = (i, chosen, logp) => {
+        if (i === list.length) { combos.push([chosen.slice(), logp]); return; }
+        for (const [v, p] of opts[i]) {
+          let lp = logp + Math.log(Math.max(p, 1e-6));
+          for (let j = 0; j < i; j++) if (list[j].r < list[i].r && chosen[j] >= v) lp += VIOLATION;
+          if (chosen.includes(v)) lp += VIOLATION * 3;        // samme tal to gange er umuligt
+          chosen.push(v); walk(i + 1, chosen, lp); chosen.pop();
+        }
+      };
+      walk(0, [], 0);
+      const mx = combos.reduce((m, c) => Math.max(m, c[1]), -Infinity);
+      const z = combos.reduce((a, c) => a + Math.exp(c[1] - mx), 0);
+      const best = combos.reduce((a, b) => (b[1] > a[1] ? b : a))[0];
+      list.forEach((f, i) => {
+        // sandsynligheden for det valgte tal, når kolonnens rækkefølge tages med
+        const marg = combos.reduce((a, c) => a + (c[0][i] === best[i] ? Math.exp(c[1] - mx) : 0), 0) / z;
+        f.res = { ...f.res, value: best[i], confidence: marg, col: colOf(best[i]) };
+      });
+    }
+  }
+
   async function recognize(warped, onProgress) {
     const gray = grayOf(warped);
     const W = warped.width;
@@ -792,11 +830,15 @@ window.Scanner = (() => {
     const cand = [];
     let done = 0;
     for (const f of found) {
-      const res = Digits.readNumber(f.parts, W, f.c);
-      if (res) cand.push({ r: f.r, c: res.col, value: res.value, unsure: res.confidence < 0.93 || res.col !== f.c, score: res.confidence + (res.col === f.c ? 1 : 0) + f.area / 1e5 });
+      f.res = Digits.readNumber(f.parts, W, f.c);
       done++;
       onProgress && onProgress(0.1 + 0.9 * done / found.length, `Læser tal ${done} af ${found.length} …`);
       if (done % 4 === 0) await new Promise(r => setTimeout(r, 0));
+    }
+    orderColumns(found.filter(f => f.res));
+    for (const f of found) {
+      const res = f.res;
+      if (res) cand.push({ r: f.r, c: res.col, value: res.value, unsure: res.confidence < 0.93 || res.col !== f.c, score: res.confidence + (res.col === f.c ? 1 : 0) + f.area / 1e5 });
     }
     const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
     const unsure = Array.from({ length: ROWS }, () => Array(COLS).fill(false));

@@ -480,6 +480,14 @@
       el.classList.toggle('ok', cnt === 5);
       if (cnt && cnt !== 5) warnings.push(`Række ${r + 1} har ${cnt} tal (normalt 5)`);
     }
+    // tallene stiger normalt nedad i hver kolonne (fx 33 over 34)
+    for (let c = 0; c < COLS; c++) {
+      const col = grid.map(row => row[c]).filter(v => v != null && !isNaN(v));
+      if (col.some((v, i) => i && v <= col[i - 1])) {
+        const [lo, hi] = colRange(c);
+        warnings.push(`Kolonne ${lo}–${hi}: tallene plejer at stige nedad – tjek dem`);
+      }
+    }
     if (!total) errors.push('Pladen har ingen tal endnu');
     const box = $('#editErrors');
     const uniq = [...new Set(errors)];

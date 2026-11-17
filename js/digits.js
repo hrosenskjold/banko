@@ -227,7 +227,11 @@ window.Digits = (() => {
     const mx = Math.max(...scores.map(x => x[1]));
     const z = scores.reduce((a, x) => a + Math.exp(x[1] - mx), 0);
     const [value, sc] = scores.reduce((a, b) => (b[1] > a[1] ? b : a));
-    return { value, confidence: Math.exp(sc - mx) / z, col: colOf(value) };
+    // de mest sandsynlige tal (samlet over hypoteserne) – bruges til at tjekke kolonnens rækkefølge
+    const byVal = new Map();
+    for (const [n, x] of scores) byVal.set(n, (byVal.get(n) || 0) + Math.exp(x - mx) / z);
+    const top = [...byVal.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+    return { value, confidence: Math.exp(sc - mx) / z, col: colOf(value), top };
   }
 
   return { readNumber, normalizeDigit, classify };
