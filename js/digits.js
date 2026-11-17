@@ -2,37 +2,66 @@
    MNIST + mange skrifttyper. Vægtene ligger i js/digit-model.js (window.DIGIT_MODEL).
    normalizeDigit() SKAL matche digitnorm.py, som modellen er trænet med. */
 window.Digits = (() => {
+  // Model: CNN (conv 3x3 + ReLU, 2x2 max-pool, tætte lag). 11 klasser: 0-9 og 10 = "ikke et ciffer".
   let net = null;
   function model() {
     if (net) return net;
     const M = window.DIGIT_MODEL;
     if (!M) throw new Error('Ciffer-modellen mangler');
     net = M.layers.map(L => {
-      const raw = atob(L.w);
-      const W = new Float32Array(L.in * L.out);
+      if (L.type === 'pool') return L;
+      const raw = atob(L.w), W = new Float32Array(raw.length);
       for (let i = 0; i < W.length; i++) { let v = raw.charCodeAt(i); if (v > 127) v -= 256; W[i] = v * L.scale; }
-      return { in: L.in, out: L.out, W, b: Float32Array.from(L.b) };
+      return { ...L, W, b: Float32Array.from(L.b) };
     });
     return net;
   }
 
+  // x: Float32Array(784) -> sandsynligheder for 11 klasser
   function classify(x) {
-    let a = x;
-    const layers = model();
-    layers.forEach((L, li) => {
-      const o = Float32Array.from(L.b);
-      for (let i = 0; i < L.in; i++) {
-        const v = a[i]; if (!v) continue;
-        const row = i * L.out;
-        for (let j = 0; j < L.out; j++) o[j] += v * L.W[row + j];
+    let a = x, C = 1, H = 28, Wd = 28;
+    for (const L of model()) {
+      if (L.type === 'conv') {
+        const o = new Float32Array(L.out * H * Wd);
+        for (let oc = 0; oc < L.out; oc++) {
+          const ob = oc * H * Wd;
+          o.fill(L.b[oc], ob, ob + H * Wd);
+          for (let ic = 0; ic < C; ic++) {
+            const ib = ic * H * Wd, wb = (oc * C + ic) * 9;
+            for (let ky = -1; ky <= 1; ky++) for (let kx = -1; kx <= 1; kx++) {
+              const wv = L.W[wb + (ky + 1) * 3 + kx + 1];
+              if (!wv) continue;
+              const y0 = Math.max(0, -ky), y1 = Math.min(H, H - ky), x0 = Math.max(0, -kx), x1 = Math.min(Wd, Wd - kx);
+              for (let y = y0; y < y1; y++) {
+                const orow = ob + y * Wd, irow = ib + (y + ky) * Wd + kx;
+                for (let xx = x0; xx < x1; xx++) o[orow + xx] += wv * a[irow + xx];
+              }
+            }
+          }
+        }
+        for (let i = 0; i < o.length; i++) if (o[i] < 0) o[i] = 0;
+        a = o; C = L.out;
+      } else if (L.type === 'pool') {
+        const h2 = H >> 1, w2 = Wd >> 1, o = new Float32Array(C * h2 * w2);
+        for (let c = 0; c < C; c++) for (let y = 0; y < h2; y++) for (let xx = 0; xx < w2; xx++) {
+          const i = c * H * Wd + 2 * y * Wd + 2 * xx;
+          o[c * h2 * w2 + y * w2 + xx] = Math.max(a[i], a[i + 1], a[i + Wd], a[i + Wd + 1]);
+        }
+        a = o; H = h2; Wd = w2;
+      } else {
+        const o = Float32Array.from(L.b);
+        for (let j = 0; j < L.out; j++) {
+          let sum = o[j]; const row = j * L.in;
+          for (let i = 0; i < L.in; i++) sum += a[i] * L.W[row + i];
+          o[j] = L.relu && sum < 0 ? 0 : sum;
+        }
+        a = o;
       }
-      if (li < layers.length - 1) for (let j = 0; j < o.length; j++) if (o[j] < 0) o[j] = 0;
-      a = o;
-    });
+    }
     const mx = Math.max(...a);
     const e = Array.from(a, v => Math.exp(v - mx));
-    const s = e.reduce((p, q) => p + q, 0);
-    return e.map(v => v / s);
+    const sm = e.reduce((p, q) => p + q, 0);
+    return e.map(v => v / sm);
   }
 
   // mask: Uint8Array (1 = blæk), w x h  ->  Float32Array(784)
@@ -106,12 +135,17 @@ window.Digits = (() => {
     }
     return { m, w, h };
   }
-  // læs cifret med normal, lidt tykkere og lidt tyndere streg og tag gennemsnittet
+  // læs tegnet med normal og lidt tykkere streg og tag gennemsnittet (11 klasser)
+  const cache = new WeakMap();
   function probsOf(g, W) {
+    if (cache.has(g)) return cache.get(g);
     const { m, w, h } = glyphMask(g, W);
-    const variants = [0, 1, 2].map(e => classify(normalizeDigit(m, w, h, e)));
-    return variants[0].map((_, k) => (variants[0][k] * 2 + variants[1][k] + variants[2][k]) / 4);
+    const a = classify(normalizeDigit(m, w, h, 0)), b = classify(normalizeDigit(m, w, h, 1));
+    const p = a.map((v, k) => (2 * v + b[k]) / 3);
+    cache.set(g, p);
+    return p;
   }
+  const NOT_DIGIT = 10;
 
   // del et bredt tegn (to sammenskrevne cifre) ved den tyndeste lodrette søjle
   function splitGlyph(g, W) {
@@ -148,6 +182,12 @@ window.Digits = (() => {
       }
       glyphs.push(glyphOf([p], W));
     }
+    // smid tegn væk, som tydeligt ikke er cifre (linjerester, klatter, hjørner)
+    if (glyphs.length > 1) {
+      const keep = glyphs.filter(g => probsOf(g, W)[NOT_DIGIT] < 0.6);
+      if (keep.length) glyphs = keep;
+    }
+    if (glyphs.length === 1 && probsOf(glyphs[0], W)[NOT_DIGIT] > 0.8) return null;
     // mere end 2 tegn: slå de tætteste sammen
     while (glyphs.length > 2) {
       let bi = 0, bg = Infinity;
@@ -169,7 +209,10 @@ window.Digits = (() => {
 
     const scores = [];
     for (const h of hyps) {
-      const P = h.glyphs.map(g => probsOf(g, W).map(p => Math.log(Math.max(p, 1e-4))));
+      const P = h.glyphs.map(g => {
+        const p = probsOf(g, W), z = 1 - p[NOT_DIGIT] * 0.5;   // fordel lidt af "ikke-ciffer" ud
+        return p.slice(0, 10).map(v => Math.log(Math.max(v / z, 1e-4)));
+      });
       for (let n = 1; n <= 90; n++) {
         const ds = String(n);
         if (ds.length !== P.length) continue;

@@ -320,6 +320,20 @@
   $('#manualBtn').addEventListener('click', () => openEditor());
   scanDialog.querySelectorAll('[data-goto]').forEach(b => b.addEventListener('click', () => showStep(b.dataset.goto)));
 
+  // find pladen automatisk og sæt hjørnerne; ellers standardhjørner til manuel justering
+  function autoCorners(announce) {
+    let q = null;
+    try { q = Scanner.detectPlate(currentImage); } catch (err) { console.error(err); }
+    if (q) {
+      crop.setCorners(q);
+      if (announce) toast('Pladen er fundet ✓ – ret hjørnerne, hvis de ikke passer');
+    } else {
+      crop.resetCorners();
+      if (announce) toast('Kunne ikke finde pladen – træk hjørnerne på plads');
+    }
+    return !!q;
+  }
+
   async function onFile(e) {
     const file = e.target.files && e.target.files[0];
     e.target.value = '';
@@ -328,11 +342,12 @@
       currentImage = await Scanner.loadImage(file);
       showStep('crop');
       crop.setImage(currentImage);
+      autoCorners(true);
     } catch (err) { toast(err.message); }
   }
   $('#cameraInput').addEventListener('change', onFile);
   $('#galleryInput').addEventListener('change', onFile);
-  $('#autoCornersBtn').addEventListener('click', () => crop.resetCorners());
+  $('#autoCornersBtn').addEventListener('click', () => autoCorners(true));
   function rotateImage(dir) {
     if (!currentImage) return;
     const src = currentImage, c = document.createElement('canvas');
@@ -343,23 +358,34 @@
     ctx.drawImage(src, -src.width / 2, -src.height / 2);
     currentImage = c;
     crop.setImage(c);
+    autoCorners(false);
   }
   $('#rotLeftBtn').addEventListener('click', () => rotateImage(-1));
   $('#rotRightBtn').addEventListener('click', () => rotateImage(1));
 
   $('#runOcrBtn').addEventListener('click', async () => {
     if (!currentImage) return;
-    const warped = Scanner.warp(currentImage, crop.corners);
+    let q = crop.corners.map(p => p.slice());
+    // står firkanten på højkant, er langsiden (9 kolonner) lodret: drej hjørnerækkefølgen
+    const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+    if (d(q[0], q[1]) + d(q[2], q[3]) < d(q[1], q[2]) + d(q[3], q[0])) q = [q[1], q[2], q[3], q[0]];
     showStep('ocr');
     const bar = $('#ocrBar'), status = $('#ocrStatus');
     bar.style.width = '0%';
     try {
-      const res = await Scanner.recognize(warped, (p, msg) => {
-        bar.style.width = Math.round(p * 100) + '%';
-        if (msg) status.textContent = msg;
-      });
+      // læs pladen begge veje (den kan ligge på hovedet) og brug den læsning, der giver mest mening
+      let best = null;
+      const tries = [q, [q[2], q[3], q[0], q[1]]];
+      for (let t = 0; t < tries.length; t++) {
+        const warped = Scanner.warp(currentImage, tries[t]);
+        const res = await Scanner.recognize(warped, (p, msg) => {
+          bar.style.width = Math.round((t + p) / tries.length * 100) + '%';
+          if (msg) status.textContent = msg;
+        });
+        if (!best || res.quality > best.res.quality) best = { res, warped };
+      }
       scanDialog.close();
-      openEditor({ grid: res.grid, unsure: res.unsure, preview: warped.toDataURL('image/jpeg', 0.85) });
+      openEditor({ grid: best.res.grid, unsure: best.res.unsure, preview: best.warped.toDataURL('image/jpeg', 0.85) });
     } catch (err) {
       console.error(err);
       toast(err.message || 'Scanningen fejlede');
