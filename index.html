@@ -91,6 +91,24 @@
       <button class="icon-btn close-btn" data-close aria-label="Luk">✕</button>
     </div>
 
+    <div class="scan-step live-step" data-step="live" hidden>
+      <div class="live-wrap">
+        <video id="liveVideo" playsinline muted autoplay></video>
+        <canvas id="liveOverlay"></canvas>
+        <div class="live-top">
+          <span id="liveStatus" class="live-status">Starter kameraet …</span>
+          <button class="icon-btn live-close" data-close aria-label="Luk">✕</button>
+        </div>
+        <div class="live-bottom">
+          <label class="live-side" title="Vælg et billede fra galleriet">🖼️<span>Galleri</span>
+            <input id="liveGallery" type="file" accept="image/*" hidden>
+          </label>
+          <button id="shutterBtn" class="shutter" type="button" aria-label="Tag billede nu"><span></span></button>
+          <button id="torchBtn" class="live-side" type="button" title="Lommelygte">🔦<span>Lys</span></button>
+        </div>
+      </div>
+    </div>
+
     <div class="scan-step" data-step="pick">
       <p>Tag et billede af <b>én plade</b> ad gangen – gerne ovenfra og med godt lys. Pladen må gerne ligge skævt.</p>
       <div class="pick-buttons">

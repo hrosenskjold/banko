@@ -91,14 +91,14 @@ window.Scanner = (() => {
   // tilpasses rette linjer, og kandidater scores efter om der ligger linjer på de indre
   // gitterpositioner (8 lodrette + 2 vandrette). Returnerer 4 hjørner (TL,TR,BR,BL – langsiden
   // øverst, dvs. 9 kolonner langs TL→TR) i kildebilledets koordinater, eller null.
-  function detectPlate(src) {
+  function detectPlate(src, maxDim = 1000) {
     // 1. forsøg: gråtoner (virker også med farvede trykte gitre). 2. forsøg: lysstyrke (største
     // farvekanal) – her forsvinder farvet tusch-skravering næsten, mens sorte/blyantslinjer bliver.
-    return detectWith(src, 'gray') || detectWith(src, 'value');
+    return detectWith(src, 'gray', maxDim) || detectWith(src, 'value', maxDim);
   }
 
-  function detectWith(src, mode) {
-    const s = Math.min(1, 1000 / Math.max(src.width, src.height));
+  function detectWith(src, mode, maxDim) {
+    const s = Math.min(1, maxDim / Math.max(src.width, src.height));
     const w = Math.round(src.width * s), h = Math.round(src.height * s);
     const c = document.createElement('canvas'); c.width = w; c.height = h;
     c.getContext('2d').drawImage(src, 0, 0, w, h);
@@ -838,14 +838,15 @@ window.Scanner = (() => {
     orderColumns(found.filter(f => f.res));
     for (const f of found) {
       const res = f.res;
-      if (res) cand.push({ r: f.r, c: res.col, value: res.value, unsure: res.confidence < 0.93 || res.col !== f.c, score: res.confidence + (res.col === f.c ? 1 : 0) + f.area / 1e5 });
+      if (res) cand.push({ r: f.r, c: res.col, value: res.value, conf: res.confidence, unsure: res.confidence < 0.93 || res.col !== f.c, score: res.confidence + (res.col === f.c ? 1 : 0) + f.area / 1e5 });
     }
     const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
     const unsure = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
     const score = Array.from({ length: ROWS }, () => Array(COLS).fill(-1));
+    const conf = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
     for (const k of cand.sort((a, b) => b.score - a.score)) {
       if (score[k.r][k.c] >= 0) { unsure[k.r][k.c] = true; continue; }   // to tal i samme felt
-      grid[k.r][k.c] = k.value; unsure[k.r][k.c] = k.unsure; score[k.r][k.c] = k.score;
+      grid[k.r][k.c] = k.value; unsure[k.r][k.c] = k.unsure; score[k.r][k.c] = k.score; conf[k.r][k.c] = k.conf;
     }
     // samme tal to steder: behold det sikreste
     const seen = new Map();
@@ -868,7 +869,7 @@ window.Scanner = (() => {
       if (unsure[r][c]) quality -= 0.3;
     }
     quality += rowCounts.filter(n => n === 5).length * 0.5;
-    return { grid, unsure, rowCounts, quality };
+    return { grid, unsure, conf, rowCounts, quality };
   }
 
   return { loadImage, warp, CropUI, recognize, detectPlate, colOf, colRange, ROWS, COLS };

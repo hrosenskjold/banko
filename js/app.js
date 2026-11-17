@@ -315,8 +315,15 @@
 
   function showStep(step) {
     scanDialog.querySelectorAll('.scan-step').forEach(s => { s.hidden = s.dataset.step !== step; });
+    scanDialog.classList.toggle('live-mode', step === 'live');
+    if (step !== 'live') live.stop();
   }
-  $('#scanBtn').addEventListener('click', () => { showStep('pick'); scanDialog.showModal(); });
+  $('#scanBtn').addEventListener('click', () => {
+    scanDialog.showModal();
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) { showStep('live'); live.start(); }
+    else showStep('pick');
+  });
+  scanDialog.addEventListener('close', () => live.stop());
   $('#manualBtn').addEventListener('click', () => openEditor());
   scanDialog.querySelectorAll('[data-goto]').forEach(b => b.addEventListener('click', () => showStep(b.dataset.goto)));
 
@@ -363,27 +370,32 @@
   $('#rotLeftBtn').addEventListener('click', () => rotateImage(-1));
   $('#rotRightBtn').addEventListener('click', () => rotateImage(1));
 
-  $('#runOcrBtn').addEventListener('click', async () => {
-    if (!currentImage) return;
-    let q = crop.corners.map(p => p.slice());
+  // Læs pladen begge veje (den kan ligge på hovedet) og brug den læsning, der giver mest mening.
+  async function readPlate(img, corners, onProgress) {
+    let q = corners.map(p => p.slice());
     // står firkanten på højkant, er langsiden (9 kolonner) lodret: drej hjørnerækkefølgen
     const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
     if (d(q[0], q[1]) + d(q[2], q[3]) < d(q[1], q[2]) + d(q[3], q[0])) q = [q[1], q[2], q[3], q[0]];
+    let best = null;
+    const tries = [q, [q[2], q[3], q[0], q[1]]];
+    for (let t = 0; t < tries.length; t++) {
+      const warped = Scanner.warp(img, tries[t]);
+      const res = await Scanner.recognize(warped, (p, msg) => onProgress && onProgress((t + p) / tries.length, msg));
+      if (!best || res.quality > best.res.quality) best = { res, warped };
+    }
+    return best;
+  }
+
+  $('#runOcrBtn').addEventListener('click', async () => {
+    if (!currentImage) return;
     showStep('ocr');
     const bar = $('#ocrBar'), status = $('#ocrStatus');
     bar.style.width = '0%';
     try {
-      // læs pladen begge veje (den kan ligge på hovedet) og brug den læsning, der giver mest mening
-      let best = null;
-      const tries = [q, [q[2], q[3], q[0], q[1]]];
-      for (let t = 0; t < tries.length; t++) {
-        const warped = Scanner.warp(currentImage, tries[t]);
-        const res = await Scanner.recognize(warped, (p, msg) => {
-          bar.style.width = Math.round((t + p) / tries.length * 100) + '%';
-          if (msg) status.textContent = msg;
-        });
-        if (!best || res.quality > best.res.quality) best = { res, warped };
-      }
+      const best = await readPlate(currentImage, crop.corners, (p, msg) => {
+        bar.style.width = Math.round(p * 100) + '%';
+        if (msg) status.textContent = msg;
+      });
       scanDialog.close();
       openEditor({ grid: best.res.grid, unsure: best.res.unsure, preview: best.warped.toDataURL('image/jpeg', 0.85) });
     } catch (err) {
@@ -392,6 +404,197 @@
       showStep('crop');
     }
   });
+
+  /* ================= live-scanner ================= */
+  // Kameraet kører; pladen findes løbende. Når den står stille, læses tallene automatisk.
+  // Er nogle felter usikre, læses op til 3 billeder, og tallene stemmes sammen pr. felt.
+  const live = (() => {
+    const video = $('#liveVideo'), overlay = $('#liveOverlay'), statusEl = $('#liveStatus');
+    const work = document.createElement('canvas');
+    let stream = null, timer = null, running = false, busy = false;
+    let lastQ = null, stable = 0, reads = [], torchOn = false, wanted = false;
+
+    function setStatus(text, found) { statusEl.textContent = text; statusEl.classList.toggle('found', !!found); }
+
+    async function start() {
+      reads = []; lastQ = null; stable = 0; busy = false; wanted = true;
+      setStatus('Starter kameraet …');
+      draw(null);
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false,
+        });
+      } catch (err) {
+        console.warn(err);
+        if (wanted) { toast('Kameraet kunne ikke startes – tag eller vælg et billede i stedet'); showStep('pick'); }
+        return;
+      }
+      // brugeren kan være gået videre (galleri/luk), mens kameraet startede
+      if (!wanted || !scanDialog.open) { stream.getTracks().forEach(t => t.stop()); stream = null; return; }
+      video.srcObject = stream;
+      try { await video.play(); } catch (e) { /* autoplay kan kræve brugerhandling */ }
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      $('#torchBtn').hidden = !caps.torch;
+      running = true;
+      setStatus('Ret kameraet mod én plade');
+      loop();
+    }
+
+    function stop() {
+      running = false; wanted = false;
+      clearTimeout(timer);
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+      video.srcObject = null;
+      torchOn = false;
+      $('#torchBtn').classList.remove('on');
+      overlay.getContext('2d').clearRect(0, 0, overlay.width, overlay.height);
+    }
+
+    // hvor vises videoen (object-fit: cover)?
+    function viewRect() {
+      const W = overlay.clientWidth, H = overlay.clientHeight;
+      const vw = video.videoWidth || W, vh = video.videoHeight || H;
+      const s = Math.max(W / vw, H / vh);   // object-fit: cover
+      return { s, ox: (W - vw * s) / 2, oy: (H - vh * s) / 2, W, H };
+    }
+
+    function draw(q, progress = 0) {
+      const dpr = window.devicePixelRatio || 1;
+      const { s, ox, oy, W, H } = viewRect();
+      if (overlay.width !== Math.round(W * dpr) || overlay.height !== Math.round(H * dpr)) {
+        overlay.width = Math.round(W * dpr); overlay.height = Math.round(H * dpr);
+      }
+      const ctx = overlay.getContext('2d');
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+      if (!q) {
+        // sigtehjælp: en bred ramme i bankopladens format
+        const gw = Math.min(W * 0.9, Math.max(120, H - 240) * 2.8), gh = gw / 2.8;
+        const gx = (W - gw) / 2, gy = (H - gh) / 2, L = 26;
+        ctx.strokeStyle = 'rgba(255,255,255,.75)'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+        for (const [x, y, dx, dy] of [[gx, gy, 1, 1], [gx + gw, gy, -1, 1], [gx + gw, gy + gh, -1, -1], [gx, gy + gh, 1, -1]]) {
+          ctx.beginPath(); ctx.moveTo(x + dx * L, y); ctx.lineTo(x, y); ctx.lineTo(x, y + dy * L); ctx.stroke();
+        }
+        return;
+      }
+      const p = q.map(([x, y]) => [ox + x * s, oy + y * s]);
+      ctx.fillStyle = 'rgba(255, 201, 60, .14)';
+      ctx.strokeStyle = '#ffc93c'; ctx.lineWidth = 4; ctx.shadowColor = '#ffc93c'; ctx.shadowBlur = 12;
+      ctx.beginPath(); p.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y))); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.shadowBlur = 0;
+      if (progress > 0) {   // fremdriftsring midt på pladen
+        const cx = p.reduce((a, v) => a + v[0], 0) / 4, cy = p.reduce((a, v) => a + v[1], 0) / 4;
+        ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(0,0,0,.35)';
+        ctx.beginPath(); ctx.arc(cx, cy, 26, 0, Math.PI * 2); ctx.stroke();
+        ctx.strokeStyle = '#ffc93c';
+        ctx.beginPath(); ctx.arc(cx, cy, 26, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, progress)); ctx.stroke();
+      }
+    }
+
+    function grabFrame(maxDim) {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const k = Math.min(1, maxDim / Math.max(vw, vh));
+      work.width = Math.round(vw * k); work.height = Math.round(vh * k);
+      work.getContext('2d').drawImage(video, 0, 0, work.width, work.height);
+      return { canvas: work, k };
+    }
+
+    const STABLE_FRAMES = 3;
+    async function loop() {
+      if (!running) return;
+      timer = setTimeout(loop, 180);
+      if (busy || !video.videoWidth) return;
+      busy = true;
+      try {
+        const { canvas, k } = grabFrame(720);
+        let q = Scanner.detectPlate(canvas, 720);
+        q = q && q.map(([x, y]) => [x / k, y / k]);
+        const diag = Math.hypot(video.videoWidth, video.videoHeight);
+        const moved = q && lastQ ? Math.max(...q.map((p, i) => Math.hypot(p[0] - lastQ[i][0], p[1] - lastQ[i][1]))) : Infinity;
+        stable = q ? (moved < diag * 0.015 ? stable + 1 : 1) : 0;
+        lastQ = q;
+        draw(q, q ? stable / STABLE_FRAMES : 0);
+        if (!q) setStatus(reads.length ? 'Hold pladen i billedet …' : 'Ret kameraet mod én plade – hele pladen skal være med');
+        else if (stable < STABLE_FRAMES) setStatus('Plade fundet – hold stille …', true);
+        else await capture(q);
+      } catch (err) { console.error(err); }
+      busy = false;
+    }
+
+    async function capture(qLive) {
+      // fuld opløsning til aflæsningen; find hjørnerne igen præcist
+      const full = document.createElement('canvas');
+      full.width = video.videoWidth; full.height = video.videoHeight;
+      full.getContext('2d').drawImage(video, 0, 0);
+      const q = Scanner.detectPlate(full) || qLive;
+      if (navigator.vibrate) navigator.vibrate(30);
+      setStatus(reads.length ? `Læser tallene … (billede ${reads.length + 1})` : 'Læser tallene …', true);
+      const best = await readPlate(full, q);
+      if (!running) return;
+      reads.push(best);
+      stable = 0;
+      const unsureCount = best.res.unsure.flat().filter(Boolean).length;
+      if (unsureCount === 0 || reads.length >= 3) finish();
+      else setStatus(`${unsureCount} usikre felter – læser et billede mere …`, true);
+    }
+
+    // stem flere aflæsninger sammen pr. felt (summen af sikkerhed for hvert bud)
+    function merge(list) {
+      const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(null));
+      const unsure = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
+      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+        const votes = new Map();
+        let empty = 0, anyUnsure = false;
+        for (const { res } of list) {
+          const v = res.grid[r][c];
+          if (res.unsure[r][c]) anyUnsure = true;
+          if (v == null) { empty += res.unsure[r][c] ? 0.3 : 1; continue; }
+          votes.set(v, (votes.get(v) || 0) + Math.max(0.05, res.conf[r][c] || 0.5));
+        }
+        let bv = null, bs = empty;
+        for (const [v, sc] of votes) if (sc > bs) { bv = v; bs = sc; }
+        grid[r][c] = bv;
+        const agree = list.every(({ res }) => res.grid[r][c] === bv);
+        unsure[r][c] = !agree || (anyUnsure && bs / list.length < 0.9);
+      }
+      return { grid, unsure };
+    }
+
+    function finish() {
+      const best = reads.reduce((a, b) => (b.res.quality > a.res.quality ? b : a));
+      const merged = reads.length > 1 ? merge(reads) : best.res;
+      stop();
+      scanDialog.close();
+      openEditor({ grid: merged.grid, unsure: merged.unsure, preview: best.warped.toDataURL('image/jpeg', 0.85) });
+    }
+
+    // udløser: tag billedet nu og gå til manuel justering af hjørnerne
+    $('#shutterBtn').addEventListener('click', () => {
+      if (!video.videoWidth) return;
+      if (reads.length) { finish(); return; }      // vi har allerede en aflæsning – brug den
+      const c = document.createElement('canvas');
+      c.width = video.videoWidth; c.height = video.videoHeight;
+      c.getContext('2d').drawImage(video, 0, 0);
+      stop();
+      currentImage = c;
+      showStep('crop');
+      crop.setImage(c);
+      autoCorners(true);
+    });
+    $('#liveGallery').addEventListener('change', e => { stop(); onFile(e); });
+    $('#torchBtn').addEventListener('click', async () => {
+      const track = stream && stream.getVideoTracks()[0];
+      if (!track) return;
+      torchOn = !torchOn;
+      try { await track.applyConstraints({ advanced: [{ torch: torchOn }] }); } catch (e) { torchOn = false; }
+      $('#torchBtn').classList.toggle('on', torchOn);
+    });
+    document.addEventListener('visibilitychange', () => { if (document.hidden && running) scanDialog.close(); });
+
+    return { start, stop };
+  })();
 
   /* ================= editor ================= */
   const editDialog = $('#editDialog');
