@@ -153,7 +153,7 @@ window.Scanner = (() => {
     const cands = comps.filter(k => k.area > w * h * 0.03 && k.n < k.area * 0.5 && k.n > w * h * 0.002)
       .sort((a, b) => b.area - a.area).slice(0, 6);
 
-    let best = null;
+    const passed = [];
     for (const k of cands) {
       // yderpunkter pr. række og søjle -> konveks hylster
       const pts = [];
@@ -169,17 +169,44 @@ window.Scanner = (() => {
       }
       const quad = quadFromPoints(pts, w, h);
       if (!quad) continue;
-      // prøv begge tolkninger af hvilken side der er langsiden (9 kolonner)
+      let candBest = null;
+      // prøv begge tolkninger af hvilken retning der har 9 kolonner (felterne kan være
+      // høje, smalle eller kvadratiske, så langsiden siger ikke altid noget)
       for (const q0 of [quad, [quad[1], quad[2], quad[3], quad[0]]]) {
-        if (gridScore(bin, w, h, q0) < 0.1) continue;
-        const q = snapSides(bin, w, h, q0);
-        const ev = gridEvidence(bin, w, h, q);
-        if (!best || ev.score > best.score) best = { ...ev, q };
+        const vs = snapSides(bin, w, h, q0);
+        // hurtig forsortering: ligner hverken den snappede eller den oprindelige firkant et gitter, spring over
+        const e0 = gridEvidence(bin, w, h, vs[0]), eL = vs.length > 1 ? gridEvidence(bin, w, h, vs[vs.length - 1]) : e0;
+        if (Math.max(e0.nv, eL.nv) < 4 || Math.max(e0.nh, eL.nh) < 1) continue;
+        vs.forEach((q, i) => {
+          const ev = i === 0 ? e0 : i === vs.length - 1 ? eL : gridEvidence(bin, w, h, q);
+          if (ev.ok && (!candBest || ev.score > candBest.score)) candBest = { ...ev, q };
+        });
       }
+      if (candBest) passed.push(candBest);
     }
-    // en rigtig plade har (næsten) alle 14 gitterlinjer; kasser, brikker og rod har få
-    if (!best || best.lines < 11) return null;
-    return best.q.map(([x, y]) => [x / s, y / s]);
+    if (!passed.length) return null;
+    // ligger et godkendt gitter inden i et andet, er det inderste selve gitteret
+    // (det ydre er papirkanten eller en ramme omkring pladen)
+    const inside = (a, b) => a.q.every(([x, y]) => pointInQuad(x, y, b.q));
+    // flere plader i billedet: foretræk den nær midten (den man sigter efter)
+    const centre = c => {
+      const mx = c.q.reduce((a, p) => a + p[0], 0) / 4, my = c.q.reduce((a, p) => a + p[1], 0) / 4;
+      return c.score - 6 * Math.hypot(mx - w / 2, my - h / 2) / Math.hypot(w, h);
+    };
+    let pick = passed.reduce((a, b) => (centre(b) > centre(a) ? b : a));
+    for (const c of passed) if (c !== pick && inside(c, pick) && c.score >= pick.score - 3) pick = c;
+    return pick.q.map(([x, y]) => [x / s, y / s]);
+  }
+
+  function pointInQuad(x, y, q) {
+    let sign = 0;
+    for (let i = 0; i < 4; i++) {
+      const [ax, ay] = q[i], [bx, by] = q[(i + 1) % 4];
+      const c = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+      if (Math.abs(c) < 1e-9) continue;
+      if (!sign) sign = Math.sign(c); else if (Math.sign(c) !== sign) return false;
+    }
+    return true;
   }
 
   function convexHull(points) {
@@ -193,9 +220,65 @@ window.Scanner = (() => {
 
   // hylster -> firkant: fjern det hjørne der koster mindst areal, til der er 4 tilbage;
   // tilpas så hver side en ret linje gennem randpunkterne og skær linjerne.
+  // Firkant ud fra omridsets fire dominerende retninger: kanterne i det konvekse hylster
+  // grupperes i "vandrette" og "lodrette", hver side lægges som støttelinje langs ydersiden,
+  // og hjørnerne er skæringerne. Virker også når hjørnerne mangler i blækket (ingen ydre kant).
+  function quadFromDirections(hull, w, h) {
+    const n = hull.length;
+    if (n < 4) return null;
+    const edges = [];
+    for (let i = 0; i < n; i++) {
+      const a = hull[i], b = hull[(i + 1) % n], L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (L > 0) edges.push({ a, b, L, ang: Math.atan2(b[1] - a[1], b[0] - a[0]) });
+    }
+    // to hovedretninger (vinkel mod 180°) – længdevægtet, via dobbeltvinkel
+    let c2 = 0, s2 = 0;
+    for (const e of edges) { c2 += e.L * Math.cos(2 * e.ang); s2 += e.L * Math.sin(2 * e.ang); }
+    const main = Math.atan2(s2, c2) / 2;            // den mest dominerende retning
+    const dirs = [main, main + Math.PI / 2];
+    const diff = (a, b) => { let d = Math.abs(((a - b) % Math.PI + Math.PI) % Math.PI); return Math.min(d, Math.PI - d); };
+    const cx = hull.reduce((a, p) => a + p[0], 0) / n, cy = hull.reduce((a, p) => a + p[1], 0) / n;
+    const lines = [];   // [punkt, retningsvektor]
+    for (const base of dirs) {
+      // kanter tæt på denne retning; forfin retningen pr. side (perspektiv giver forskellige vinkler)
+      const near = edges.filter(e => diff(e.ang, base) < Math.PI / 7);
+      for (const side of [1, -1]) {
+        const nx = -Math.sin(base) * side, ny = Math.cos(base) * side;
+        const mine = near.filter(e => ((e.a[0] + e.b[0]) / 2 - cx) * nx + ((e.a[1] + e.b[1]) / 2 - cy) * ny > 0);
+        let ang = base;
+        if (mine.length) {
+          let cc = 0, ss = 0;
+          for (const e of mine) { cc += e.L * Math.cos(2 * e.ang); ss += e.L * Math.sin(2 * e.ang); }
+          ang = Math.atan2(ss, cc) / 2;
+        }
+        const dx = Math.cos(ang), dy = Math.sin(ang);
+        let mx = -Infinity, mp = null;               // støttelinje: yderste punkt i normalens retning
+        const ux = -dy * Math.sign(-dy * nx + dx * ny || 1), uy = dx * Math.sign(-dy * nx + dx * ny || 1);
+        for (const p of hull) { const v = p[0] * ux + p[1] * uy; if (v > mx) { mx = v; mp = p; } }
+        lines.push({ p: mp, d: [dx, dy], base, side });
+      }
+    }
+    // rækkefølge rundt om: dirs[0] side+, dirs[1] side+, dirs[0] side-, dirs[1] side-
+    const ord = [lines[0], lines[2], lines[1], lines[3]];
+    const inter = (A, B) => {
+      const [x1, y1] = A.p, [x2, y2] = [A.p[0] + A.d[0], A.p[1] + A.d[1]];
+      const [x3, y3] = B.p, [x4, y4] = [B.p[0] + B.d[0], B.p[1] + B.d[1]];
+      const d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+      if (Math.abs(d) < 1e-9) return null;
+      const a = x1 * y2 - y1 * x2, b = x3 * y4 - y3 * x4;
+      return [(a * (x3 - x4) - (x1 - x2) * b) / d, (a * (y3 - y4) - (y1 - y2) * b) / d];
+    };
+    const q = [];
+    for (let i = 0; i < 4; i++) { const pt = inter(ord[i], ord[(i + 1) % 4]); if (!pt) return null; q.push(pt); }
+    if (q.some(([x, y]) => x < -w * 0.1 || y < -h * 0.1 || x > w * 1.1 || y > h * 1.1)) return null;
+    return q;
+  }
+
   function quadFromPoints(pts, w, h) {
     let hull = convexHull(pts);
     if (hull.length < 4) return null;
+    const dq = quadFromDirections(hull, w, h);
+    if (dq) return orderQuad(dq, w, h);
     const tri = (a, b, c) => Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) / 2;
     while (hull.length > 4) {
       let bi = 0, ba = Infinity;
@@ -233,6 +316,10 @@ window.Scanner = (() => {
     let q = [];
     for (let i = 0; i < 4; i++) { const p = inter(lines[(i + 3) % 4], lines[i]); if (!p) return null; q.push(p); }
     if (q.some(([x, y]) => x < -w * 0.05 || y < -h * 0.05 || x > w * 1.05 || y > h * 1.05)) q = hull.slice();
+    return orderQuad(q, w, h);
+  }
+
+  function orderQuad(q, w, h) {
     // ordn med uret startende øverst til venstre
     const cx = q.reduce((a, p) => a + p[0], 0) / 4, cy = q.reduce((a, p) => a + p[1], 0) / 4;
     q.sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
@@ -263,38 +350,76 @@ window.Scanner = (() => {
     return on / nOn - 0.5 * off / nOff;
   }
 
-  // Hvor mange af gitterets 14 linjer (10 lodrette, 4 vandrette) findes som gennemgående
-  // streger? Hver linje må forskydes lidt (håndtegnede gitre er ujævne).
+  // Er firkanten et bankogitter? Firkanten rettes ud, og de streger, der løber (næsten) hele
+  // vejen igennem, tælles – uanset hvor de sidder. Et gitter har ~8 indre lodrette og 2 indre
+  // vandrette gennemgående linjer. Ujævne kolonner, høje/smalle felter og bølgede håndtegnede
+  // linjer er fine. Papirkant og rammer omkring pladen afvises, fordi gitterets linjer kun
+  // går gennem en del af dem, og rod afvises, fordi der er blæk overalt.
   function gridEvidence(bin, w, h, q) {
-    const map = homography([[0, 0], [COLS, 0], [COLS, ROWS], [0, ROWS]], q);
-    const ink = (u, v) => {
-      const [x, y] = map(u, v); const xi = Math.round(x), yi = Math.round(y);
-      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
-        const xx = xi + dx, yy = yi + dy;
-        if (xx >= 0 && yy >= 0 && xx < w && yy < h && bin[yy * w + xx]) return 1;
+    const NW = 540, NH = 180, map = homography([[0, 0], [NW, 0], [NW, NH], [0, NH]], q);
+    const N = new Uint8Array(NW * NH);
+    let total = 0;
+    for (let v = 0; v < NH; v++) for (let u = 0; u < NW; u++) {
+      const [x, y] = map(u + 0.5, v + 0.5), xi = Math.round(x), yi = Math.round(y);
+      if (xi >= 0 && yi >= 0 && xi < w && yi < h && bin[yi * w + xi]) { N[v * NW + u] = 1; total++; }
+    }
+    // Behold kun blæk, der indgår i lange lodrette/vandrette streger (skrå skravering, prikker
+    // og bordstruktur danner ikke lange lige streger). V = lodrette, Hh = vandrette.
+    const V = new Uint8Array(NW * NH), Hh = new Uint8Array(NW * NH);
+    const LV = Math.round(NH / ROWS * 0.4), LH = Math.round(NW / COLS * 0.4);
+    for (let u = 0; u < NW; u++) {
+      let start = -1;
+      for (let v = 0; v <= NH; v++) {
+        const on = v < NH && (N[v * NW + u] || (u > 0 && N[v * NW + u - 1]) || (u < NW - 1 && N[v * NW + u + 1]));
+        if (on && start < 0) start = v;
+        if (!on && start >= 0) { if (v - start >= LV) for (let k = start; k < v; k++) V[k * NW + u] = 1; start = -1; }
       }
-      return 0;
-    };
-    const cover = (vertical, pos, maxOff) => {
-      let best = 0;
-      for (let off = -maxOff; off <= maxOff + 1e-9; off += 0.04) {
-        let hit = 0, n = 0;
-        const len = vertical ? ROWS : COLS;
-        for (let t = 0.05; t < len - 0.05; t += 0.05) { hit += vertical ? ink(pos + off, t) : ink(t, pos + off); n++; }
-        best = Math.max(best, hit / n);
+    }
+    for (let v = 0; v < NH; v++) {
+      let start = -1;
+      for (let u = 0; u <= NW; u++) {
+        const on = u < NW && (N[v * NW + u] || (v > 0 && N[(v - 1) * NW + u]) || (v < NH - 1 && N[(v + 1) * NW + u]));
+        if (on && start < 0) start = u;
+        if (!on && start >= 0) { if (u - start >= LH) for (let k = start; k < u; k++) Hh[v * NW + k] = 1; start = -1; }
       }
-      return best;
+    }
+    const R = 3;   // tolerance for bølgede/skrå linjer
+    // dækning: andel af rækker (søjler), hvor der er blæk inden for ±R af søjlen (rækken)
+    const colCov = new Float32Array(NW), rowCov = new Float32Array(NH);
+    const v0 = Math.round(NH * 0.04), v1 = Math.round(NH * 0.96), u0 = Math.round(NW * 0.02), u1 = Math.round(NW * 0.98);
+    for (let u = 0; u < NW; u++) {
+      let hit = 0;
+      for (let v = v0; v < v1; v++) {
+        for (let d = -R; d <= R; d++) { const uu = u + d; if (uu >= 0 && uu < NW && V[v * NW + uu]) { hit++; break; } }
+      }
+      colCov[u] = hit / (v1 - v0);
+    }
+    for (let v = 0; v < NH; v++) {
+      let hit = 0;
+      for (let u = u0; u < u1; u++) {
+        for (let d = -R; d <= R; d++) { const vv = v + d; if (vv >= 0 && vv < NH && Hh[vv * NW + u]) { hit++; break; } }
+      }
+      rowCov[v] = hit / (u1 - u0);
+    }
+    const peaks = (cov, minGap, lo, hi, thr) => {
+      const idx = [];
+      for (let i = lo; i < hi; i++) if (cov[i] >= thr) idx.push(i);
+      idx.sort((a, b) => cov[b] - cov[a]);
+      const out = [];
+      for (const i of idx) if (out.every(j => Math.abs(j - i) >= minGap)) out.push(i);
+      return out.sort((a, b) => a - b);
     };
-    // baggrund: dækning midt i felterne (rod giver blæk overalt, en ren plade næsten ingen)
-    let base = 0;
-    for (let i = 0; i < COLS; i++) base += cover(true, i + 0.5, 0) / (COLS + ROWS);
-    for (let j = 0; j < ROWS; j++) base += cover(false, j + 0.5, 0) / (COLS + ROWS);
-    const cov = [];
-    for (let i = 0; i <= COLS; i++) cov.push(cover(true, i, i === 0 || i === COLS ? 0.08 : 0.3));
-    for (let j = 0; j <= ROWS; j++) cov.push(cover(false, j, j === 0 || j === ROWS ? 0.06 : 0.15));
-    const lines = cov.filter(c => c >= 0.45 && c - base >= 0.3).length;
-    const sum = cov.reduce((a, c) => a + c, 0);
-    return { lines, score: lines + sum / 14 - 3 * base, cov, base };
+    // baggrund: mediandækning (rod/bordstruktur giver blæk overalt; en plade har lidt mellem linjerne)
+    const med = arr => { const a = Array.from(arr).sort((x, y) => x - y); return a[Math.floor(a.length * 0.5)]; };
+    const base = med(colCov), rbase = med(rowCov);
+    // en linje skal løbe (næsten) hele vejen OG skille sig tydeligt ud fra baggrunden
+    const vIn = peaks(colCov, NW / 9 * 0.35, Math.round(NW * 0.04), Math.round(NW * 0.96), Math.max(0.55, base + 0.4));
+    const hIn = peaks(rowCov, NH / 3 * 0.35, Math.round(NH * 0.1), Math.round(NH * 0.9), Math.max(0.55, rbase + 0.4));
+    const density = total / (NW * NH);
+    const nv = vIn.length, nh = hIn.length;
+    const ok = nv >= 6 && nv <= 11 && nh >= 2 && nh <= 3 && base < 0.6 && density < 0.35;
+    const score = Math.min(nv, 8) + 2 * Math.min(nh, 2) - Math.max(0, nv - 8) - 2 * Math.max(0, nh - 2) - 4 * base;
+    return { ok, score, nv, nh, base };
   }
 
   // Flyt hver side ud til den yderste rigtige streg. For hver side afprøves parallelle og let
@@ -313,24 +438,44 @@ window.Scanner = (() => {
     const cx = q.reduce((a, p) => a + p[0], 0) / 4, cy = q.reduce((a, p) => a + p[1], 0) / 4;
     const len = (a, b) => Math.hypot(b[0] - a[0], b[1] - a[1]);
     const longSide = (len(q[0], q[1]) + len(q[2], q[3])) / 2, shortSide = (len(q[1], q[2]) + len(q[3], q[0])) / 2;
-    const lines = [];
+    const lines = [], orig = [];
     for (let i = 0; i < 4; i++) {
       const A = q[i], B = q[(i + 1) % 4], L = len(A, B);
       let nx = -(B[1] - A[1]) / L, ny = (B[0] - A[0]) / L;
       if ((A[0] + B[0]) / 2 * nx + (A[1] + B[1]) / 2 * ny < cx * nx + cy * ny) { nx = -nx; ny = -ny; }  // udad
       const cell = i % 2 === 0 ? shortSide / ROWS : longSide / COLS;   // top/bund: rækkehøjde, sider: kolonnebredde
       const inward = Math.round(cell * 1.2), outward = Math.max(2, Math.round(cell * 0.06));
-      const step = Math.max(1, Math.round((inward + outward) / 60));
-      const n = Math.max(40, Math.round(L / 3));
-      let res = [];
-      for (let da = -inward; da <= outward; da += step) for (let db = -inward; db <= outward; db += step) {
-        if (Math.abs(da - db) > cell * 0.5) continue;
+      const n = Math.max(40, Math.min(120, Math.round(L / 4)));
+      const evalAt = (da, db) => {
         const ax = A[0] + nx * da, ay = A[1] + ny * da, bx = B[0] + nx * db, by = B[1] + ny * db;
         let hit = 0;
         for (let k = 0; k < n; k++) { const t = 0.03 + 0.94 * k / (n - 1); hit += ink(ax + (bx - ax) * t, ay + (by - ay) * t); }
-        res.push([hit / n, da + db, [[ax, ay], [bx, by]]]);
+        return [hit / n, da + db, [[ax, ay], [bx, by]]];
+      };
+      // groft gitter af placeringer, derefter fint omkring de bedste
+      const coarse = Math.max(2, Math.round((inward + outward) / 16));
+      let res = [];
+      for (let da = -inward; da <= outward; da += coarse) for (let db = -inward; db <= outward; db += coarse) {
+        if (Math.abs(da - db) > cell * 0.5) continue;
+        res.push(evalAt(da, db));
       }
+      // forfin omkring de bedste OG de yderste gode bud (ellers kan den yderste linje gå tabt)
+      const mxc = Math.max(...res.map(r => r[0]));
+      const good0 = res.filter(r => r[0] >= mxc * 0.6);
+      const seeds = [...good0.slice().sort((a, b) => b[1] - a[1]).slice(0, 6), ...res.slice().sort((a, b) => b[0] - a[0]).slice(0, 4)];
+      const seen = new Set();
+      for (const sd of seeds) {
+        const [l0, l1] = sd[2];
+        const da0 = Math.round((l0[0] - A[0]) * nx + (l0[1] - A[1]) * ny), db0 = Math.round((l1[0] - B[0]) * nx + (l1[1] - B[1]) * ny);
+        for (let da = da0 - coarse; da <= da0 + coarse; da++) for (let db = db0 - coarse; db <= db0 + coarse; db++) {
+          if (da < -inward || da > outward || db < -inward || db > outward) continue;
+          const key = da * 10000 + db; if (seen.has(key)) continue; seen.add(key);
+          res.push(evalAt(da, db));
+        }
+      }
+      const step = 1;
       const mx = Math.max(...res.map(r => r[0]));
+      orig.push([A, B]);
       if (mx < 0.35) { lines.push([A, B]); continue; }
       const good = res.filter(r => r[0] >= mx * 0.8);
       const outer = Math.max(...good.map(r => r[1]));
@@ -345,9 +490,23 @@ window.Scanner = (() => {
       const a = x1 * y2 - y1 * x2, b = x3 * y4 - y3 * x4;
       return [(a * (x3 - x4) - (x1 - x2) * b) / d, (a * (y3 - y4) - (y1 - y2) * b) / d];
     };
-    const out = [];
-    for (let i = 0; i < 4; i++) { const p = inter(lines[(i + 3) % 4], lines[i]); if (!p) return q; out.push(p); }
-    return out;
+    // Snappet eller oprindelig side? Uden ydre kant må siden IKKE snappes ind til første indre
+    // linje; med linjer der stikker ud SKAL den. Vælg side for side med gitter-tjekket.
+    const build = L => {
+      const out = [];
+      for (let i = 0; i < 4; i++) { const p = inter(L[(i + 3) % 4], L[i]); if (!p) return null; out.push(p); }
+      return out;
+    };
+    const variants = [];
+    const seen = new Set();
+    for (let m = 0; m < 16; m++) {
+      const L = [0, 1, 2, 3].map(i => ((m >> i) & 1 ? orig[i] : lines[i]));
+      const key = L.map((l, i) => (l === orig[i] && orig[i] !== lines[i] ? 1 : 0)).join('');
+      if (seen.has(key)) continue; seen.add(key);          // sider uden snap giver samme firkant
+      const qq = build(L);
+      if (qq) variants.push(qq);
+    }
+    return variants.length ? variants : [q];
   }
 
   // Flyt hjørnerne lidt ad gangen, så længe gitteret passer bedre på stregerne.
@@ -663,15 +822,24 @@ window.Scanner = (() => {
       comps.push({ pixels, mnx, mny, mxx, mxy, bw: mxx - mnx + 1, bh: mxy - mny + 1 });
     }
     // ciffer-lignende: rimelig højde, ikke gitterlinjer, ikke støj
+    // Cifrenes typiske højde findes ud fra pladen selv (små tal i høje felter, store tal i
+    // lave felter) – i stedet for en fast andel af feltet.
+    const plausible = comps.filter(k => k.bh >= CELL * 0.08 && k.bh <= CELL * 0.92 && k.bw <= CELL * 1.0 && k.bw > 2 &&
+      k.pixels.length >= CELL * CELL * 0.0008 && k.pixels.length / (k.bw * k.bh) > 0.05);
+    const hs = plausible.map(k => k.bh).sort((a, b) => a - b);
+    // median af de største halvdel (støj er lav; cifre dominerer toppen)
+    const typH = hs.length ? hs[Math.floor(hs.length * 0.75)] : CELL * 0.5;
+    const minH = Math.max(CELL * 0.08, Math.min(CELL * 0.2, typH * 0.5));
+    const minA = Math.min(CELL * CELL * 0.003, minH * minH * 0.12);
     const digits = comps.filter(k =>
-      k.pixels.length >= CELL * CELL * 0.003 &&
-      k.bh >= CELL * 0.2 && k.bh <= CELL * 0.92 && k.bw <= CELL * 1.0 && k.bw > 2 &&
+      k.pixels.length >= minA &&
+      k.bh >= minH && k.bh <= CELL * 0.92 && k.bw <= CELL * 1.0 && k.bw > 2 &&
       // tynd stump ved billedkanten = rest af pladens kant, ikke et ciffer
       !((k.mnx === 0 || k.mny === 0 || k.mxx === W - 1 || k.mxy === H - 1) && (k.bw < CELL * 0.15 || k.bh < CELL * 0.15)) &&
       k.pixels.length / (k.bw * k.bh) > 0.05);
     // små stykker (fx 5-tallets top-streg eller en løs streg i håndskrift)
     const frags = comps.filter(k => !digits.includes(k) &&
-      k.pixels.length >= CELL * CELL * 0.0012 && k.bh < CELL * 0.35 && k.bw < CELL * 0.5);
+      k.pixels.length >= minA * 0.4 && k.bh < Math.max(minH, CELL * 0.35) && k.bw < CELL * 0.5);
 
     // saml cifre, der står side om side, til ét tal (union-find)
     const parent = digits.map((_, i) => i);
@@ -713,7 +881,7 @@ window.Scanner = (() => {
       const bx0 = Math.min(...parts.map(k => k.mnx)), bx1 = Math.max(...parts.map(k => k.mxx));
       const by0 = Math.min(...parts.map(k => k.mny)), by1 = Math.max(...parts.map(k => k.mxy));
       const area = parts.reduce((s, k) => s + k.pixels.length, 0);
-      if (area < CELL * CELL * 0.008 || bx1 - bx0 > CELL * 1.15) continue;
+      if (area < Math.min(CELL * CELL * 0.008, minA * 2.5) || bx1 - bx0 > CELL * 1.15) continue;
       nums.push({ parts, bx0, bx1, by0, by1, area, x: (bx0 + bx1) / 2, y: (by0 + by1) / 2 });
     }
 
@@ -819,7 +987,7 @@ window.Scanner = (() => {
     }
   }
 
-  async function recognize(warped, onProgress) {
+  async function recognize(warped, onProgress, aspect = 1) {
     const gray = grayOf(warped);
     const W = warped.width;
     onProgress && onProgress(0.1, 'Finder tallene …');
@@ -830,7 +998,7 @@ window.Scanner = (() => {
     const cand = [];
     let done = 0;
     for (const f of found) {
-      f.res = Digits.readNumber(f.parts, W, f.c);
+      f.res = Digits.readNumber(f.parts, W, f.c, aspect);
       done++;
       onProgress && onProgress(0.1 + 0.9 * done / found.length, `Læser tal ${done} af ${found.length} …`);
       if (done % 4 === 0) await new Promise(r => setTimeout(r, 0));

@@ -376,11 +376,13 @@
     // står firkanten på højkant, er langsiden (9 kolonner) lodret: drej hjørnerækkefølgen
     const d = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
     if (d(q[0], q[1]) + d(q[2], q[3]) < d(q[1], q[2]) + d(q[3], q[0])) q = [q[1], q[2], q[3], q[0]];
+    // felternes rigtige form (bredde/højde) – udretningen gør dem kvadratiske, så cifrene rettes tilbage
+    const aspect = ((d(q[0], q[1]) + d(q[2], q[3])) / 2 / COLS) / ((d(q[1], q[2]) + d(q[3], q[0])) / 2 / ROWS);
     let best = null;
     const tries = [q, [q[2], q[3], q[0], q[1]]];
     for (let t = 0; t < tries.length; t++) {
       const warped = Scanner.warp(img, tries[t]);
-      const res = await Scanner.recognize(warped, (p, msg) => onProgress && onProgress((t + p) / tries.length, msg));
+      const res = await Scanner.recognize(warped, (p, msg) => onProgress && onProgress((t + p) / tries.length, msg), aspect);
       if (!best || res.quality > best.res.quality) best = { res, warped };
     }
     return best;
@@ -535,9 +537,15 @@
       if (!running) return;
       reads.push(best);
       stable = 0;
+      // mindst to aflæsninger, der er enige; ellers en tredje, og så stemmes der
+      if (reads.length >= 3) { finish(); return; }
+      if (reads.length >= 2) {
+        const m = merge(reads);
+        const agree = reads.every(({ res }) => res.grid.every((row, r) => row.every((v, c) => v === m.grid[r][c])));
+        if (agree && !m.unsure.flat().some(Boolean)) { finish(); return; }
+      }
       const unsureCount = best.res.unsure.flat().filter(Boolean).length;
-      if (unsureCount === 0 || reads.length >= 3) finish();
-      else setStatus(`${unsureCount} usikre felter – læser et billede mere …`, true);
+      setStatus(reads.length === 1 && !unsureCount ? 'Tjekker med et billede mere …' : `${unsureCount || 'Nogle'} usikre felter – læser et billede mere …`, true);
     }
 
     // stem flere aflæsninger sammen pr. felt (summen af sikkerhed for hvert bud)
@@ -550,7 +558,8 @@
         for (const { res } of list) {
           const v = res.grid[r][c];
           if (res.unsure[r][c]) anyUnsure = true;
-          if (v == null) { empty += res.unsure[r][c] ? 0.3 : 1; continue; }
+          // et manglende tal skyldes oftere et sløret billede end et tomt felt -> tomme stemmer vejer mindre
+          if (v == null) { empty += res.unsure[r][c] ? 0.15 : 0.45; continue; }
           votes.set(v, (votes.get(v) || 0) + Math.max(0.05, res.conf[r][c] || 0.5));
         }
         let bv = null, bs = empty;

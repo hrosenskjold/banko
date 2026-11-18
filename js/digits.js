@@ -65,7 +65,8 @@ window.Digits = (() => {
   }
 
   // mask: Uint8Array (1 = blæk), w x h  ->  Float32Array(784)
-  function normalizeDigit(mask, w, h, extra = 0) {
+  // sx: vandret skalering der ophæver udretningens forvrængning (felternes rigtige bredde/højde)
+  function normalizeDigit(mask, w, h, extra = 0, sx = 1) {
     let x0 = w, y0 = h, x1 = -1, y1 = -1;
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (mask[y * w + x]) {
       if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
@@ -97,8 +98,9 @@ window.Digits = (() => {
     }
 
     // skalér længste side til 20 px (4x4 supersampling) og centrér efter tyngdepunkt i 28x28
-    const s = 20 / Math.max(bw, bh);
-    const th = Math.max(1, Math.round(bh * s)), tw = Math.max(1, Math.round(bw * s));
+    const ew = bw * sx;
+    const s = 20 / Math.max(ew, bh);
+    const th = Math.max(1, Math.round(bh * s)), tw = Math.max(1, Math.round(ew * s));
     const small = new Float32Array(th * tw);
     for (let i = 0; i < th; i++) for (let j = 0; j < tw; j++) {
       let acc = 0;
@@ -137,10 +139,11 @@ window.Digits = (() => {
   }
   // læs tegnet med normal og lidt tykkere streg og tag gennemsnittet (11 klasser)
   const cache = new WeakMap();
+  let SX = 1;
   function probsOf(g, W) {
     if (cache.has(g)) return cache.get(g);
     const { m, w, h } = glyphMask(g, W);
-    const a = classify(normalizeDigit(m, w, h, 0)), b = classify(normalizeDigit(m, w, h, 1));
+    const a = classify(normalizeDigit(m, w, h, 0, SX)), b = classify(normalizeDigit(m, w, h, 1, SX));
     const p = a.map((v, k) => (2 * v + b[k]) / 3);
     cache.set(g, p);
     return p;
@@ -170,7 +173,8 @@ window.Digits = (() => {
   const colOf = n => (n === 90 ? 8 : Math.floor(n / 10));
 
   // Returnerer {value, confidence (0-1), col} eller null
-  function readNumber(parts, W, posCol) {
+  function readNumber(parts, W, posCol, aspect = 1) {
+    SX = Math.max(0.3, Math.min(3, aspect));
     // saml stykker, der overlapper vandret (fx et 4-tal skrevet i to streger)
     const sorted = [...parts].sort((a, b) => a.mnx - b.mnx);
     let glyphs = [];
